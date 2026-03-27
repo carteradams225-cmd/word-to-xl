@@ -1,11 +1,9 @@
 """
 docx_to_excel.py
 
-Parses a Word document structured as:
-  - A table where one column contains section labels: Progress, Plans, Problems
-  - Division headers (plain, non-bold paragraphs above bullet groups)
-  - Bullet points where the Initiative is bold and the update follows in the same paragraph
-  - Nested sub-bullets are appended as notes to the parent bullet
+Handles Word documents where the entire content is inside a table:
+  - Column 0: Section label (Progress / Plans / Problems) — may span multiple rows
+  - Column 1+: Division header followed by bullet paragraphs within the cell
 
 Output: Formatted Excel with columns:
   Section | Division | Initiative | Progress Update
@@ -21,8 +19,6 @@ import sys
 from itertools import groupby
 from docx import Document
 from docx.oxml.ns import qn
-from docx.table import Table
-from docx.text.paragraph import Paragraph
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -61,73 +57,109 @@ def extract_bold_and_rest(para):
 
 
 def is_division_header(para):
+    """Short, non-list paragraph that isn't a section name."""
     text = para.text.strip()
     if not text or len(text) > 120:
         return False
-    if is_list_paragraph(para):
-        return False
     if text.lower() in SECTION_NAMES:
         return False
-    style = para.style.name.lower()
-    if any(x in style for x in ["heading", "title"]):
-        return True
-    bold_len = sum(len(r.text) for r in para.runs if r.bold and r.text.strip())
-    return bold_len / max(len(text), 1) < 0.5
+    if is_list_paragraph(para):
+        return False
+    return True
+
+
+def parse_cell_paragraphs(cell_paragraphs, section, results):
+    """
+    Parse paragraphs from a content cell.
+    First non-empty non-section paragraph is treated as the division header.
+    Subsequent list paragraphs are initiatives/updates.
+    Nested bullets become notes on the parent.
+    """
+    current_division = "Unknown"
+    last_top_level = None
+    found_division = False
+
+    for para in cell_paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+
+        if text.lower() in SECTION_NAMES:
+            continue
+
+        # First real paragraph in cell = division header
+        if not found_division and not is_list_paragraph(para):
+            current_division = text
+            found_division = True
+            continue
+
+        # Some docs put division header as a non-list paragraph mid-cell
+        if is_division_header(para) and not is_list_paragraph(para):
+            current_division = text
+            last_top_level = None
+            continue
+
+        if is_list_paragraph(para):
+            indent = get_indent_level(para)
+            bold, rest = extract_bold_and_rest(para)
+
+            if indent == 0:
+                entry = {
+                    "section": section,
+                    "division": current_division,
+                    "initiative": bold if bold else text,
+                    "update": rest if bold else "",
+                    "notes": [],
+                }
+                results.append(entry)
+                last_top_level = entry
+            else:
+                if last_top_level is not None:
+                    note = (bold + (": " + rest if rest else "")) if bold else text
+                    last_top_level["notes"].append(note)
+        else:
+            # Non-list paragraph after division header = treat as plain text entry
+            if found_division:
+                bold, rest = extract_bold_and_rest(para)
+                entry = {
+                    "section": section,
+                    "division": current_division,
+                    "initiative": bold if bold else text,
+                    "update": rest if bold else "",
+                    "notes": [],
+                }
+                results.append(entry)
+                last_top_level = entry
 
 
 def parse_document(path):
     doc = Document(path)
-    rows = []
+    raw_results = []
     current_section = "Unknown"
-    current_division = "Unknown"
-    last_top_level = None
 
-    for child in doc.element.body:
-        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+    for table in doc.tables:
+        for row in table.rows:
+            cells = row.cells
 
-        if tag == "tbl":
-            table = Table(child, doc)
-            for row in table.rows:
-                for cell in row.cells:
-                    if cell.text.strip().lower() in SECTION_NAMES:
-                        current_section = cell.text.strip().capitalize()
+            # Check if any cell in this row is a section label
+            for cell in cells:
+                cell_text = cell.text.strip()
+                if cell_text.lower() in SECTION_NAMES:
+                    current_section = cell_text.capitalize()
+                    break
 
-        elif tag == "p":
-            para = Paragraph(child, doc)
-            text = para.text.strip()
-            if not text:
-                continue
+            # Parse content cells (skip cells that are just section labels)
+            for cell in cells:
+                cell_text = cell.text.strip()
+                if cell_text.lower() in SECTION_NAMES:
+                    continue
+                if not cell_text:
+                    continue
+                parse_cell_paragraphs(cell.paragraphs, current_section, raw_results)
 
-            if text.lower() in SECTION_NAMES:
-                current_section = text.capitalize()
-                continue
-
-            if is_division_header(para):
-                current_division = text
-                last_top_level = None
-                continue
-
-            if is_list_paragraph(para):
-                indent = get_indent_level(para)
-                bold, rest = extract_bold_and_rest(para)
-
-                if indent == 0:
-                    entry = {
-                        "section": current_section,
-                        "division": current_division,
-                        "initiative": bold if bold else text,
-                        "update": rest if bold else "",
-                        "notes": [],
-                    }
-                    rows.append(entry)
-                    last_top_level = entry
-                else:
-                    if last_top_level is not None:
-                        note = (bold + (": " + rest if rest else "")) if bold else text
-                        last_top_level["notes"].append(note)
-
+    # Flatten notes
     result = []
-    for e in rows:
+    for e in raw_results:
         update = e["update"]
         if e["notes"]:
             notes_str = " | ".join(e["notes"])
@@ -140,6 +172,8 @@ def parse_document(path):
         })
     return result
 
+
+# ── Excel output ──────────────────────────────────────────────────────────────
 
 def thin_border():
     s = Side(style="thin", color="CCCCCC")
@@ -170,7 +204,6 @@ def write_excel(data, out_path):
         "Plans":    "375623",
         "Problems": "833C00",
     }
-
     even_fill = PatternFill("solid", start_color="EBF3FB")
     odd_fill  = PatternFill("solid", start_color="FFFFFF")
 
@@ -182,8 +215,10 @@ def write_excel(data, out_path):
     ws.row_dimensions[1].height = 28
 
     section_order = ["Progress", "Plans", "Problems"]
-    data_sorted = sorted(data, key=lambda x: section_order.index(x["section"])
-                         if x["section"] in section_order else 99)
+    data_sorted = sorted(
+        data,
+        key=lambda x: section_order.index(x["section"]) if x["section"] in section_order else 99
+    )
 
     current_row = 2
     for section_name, sec_group in groupby(data_sorted, key=lambda x: x["section"]):
@@ -202,27 +237,28 @@ def write_excel(data, out_path):
                 ws.cell(row=current_row, column=1, value=section_name)
                 apply_section_style(ws.cell(row=current_row, column=1), sec_color)
 
-                div_cell = ws.cell(row=current_row, column=2, value=division_name)
-                div_cell.font = Font(name="Arial", bold=True, size=10)
-                div_cell.fill = PatternFill("solid", start_color="D9E1F2")
-                div_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                div_cell.border = thin_border()
+                dc = ws.cell(row=current_row, column=2, value=division_name)
+                dc.font = Font(name="Arial", bold=True, size=10)
+                dc.fill = PatternFill("solid", start_color="D9E1F2")
+                dc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                dc.border = thin_border()
 
-                init_cell = ws.cell(row=current_row, column=3, value=entry["initiative"])
-                init_cell.font = Font(name="Arial", bold=True, size=10)
-                init_cell.fill = fill
-                init_cell.alignment = Alignment(vertical="top", wrap_text=True)
-                init_cell.border = thin_border()
+                ic = ws.cell(row=current_row, column=3, value=entry["initiative"])
+                ic.font = Font(name="Arial", bold=True, size=10)
+                ic.fill = fill
+                ic.alignment = Alignment(vertical="top", wrap_text=True)
+                ic.border = thin_border()
 
-                upd_cell = ws.cell(row=current_row, column=4, value=entry["update"])
-                upd_cell.font = Font(name="Arial", size=10)
-                upd_cell.fill = fill
-                upd_cell.alignment = Alignment(vertical="top", wrap_text=True)
-                upd_cell.border = thin_border()
+                uc = ws.cell(row=current_row, column=4, value=entry["update"])
+                uc.font = Font(name="Arial", size=10)
+                uc.fill = fill
+                uc.alignment = Alignment(vertical="top", wrap_text=True)
+                uc.border = thin_border()
 
                 ws.row_dimensions[current_row].height = 50
                 current_row += 1
 
+            # Merge division cells
             if current_row - 1 >= div_start:
                 ws.merge_cells(start_row=div_start, start_column=2,
                                end_row=current_row - 1, end_column=2)
@@ -234,6 +270,7 @@ def write_excel(data, out_path):
 
             div_idx += 1
 
+        # Merge section cells
         if current_row - 1 >= section_start:
             ws.merge_cells(start_row=section_start, start_column=1,
                            end_row=current_row - 1, end_column=1)
@@ -257,7 +294,7 @@ def main():
 
     data = parse_document(sys.argv[1])
     if not data:
-        print("No entries found. Verify your document structure.")
+        print("No entries found. Run diagnose.py and share the output.")
         sys.exit(1)
 
     counts = {}
