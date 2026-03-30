@@ -1,12 +1,11 @@
 """
 docx_to_excel.py
 
-Handles Word documents where the entire content is inside a table:
-  - Column 0: Section label (Progress / Plans / Problems) — may span multiple rows
-  - Column 1+: Division header followed by bullet paragraphs within the cell
+Parses a Word document (table-based structure) into a flat Excel table
+suitable for Power BI and Power Automate.
 
-Output: Formatted Excel with columns:
-  Section | Division | Initiative | Progress Update
+Every row contains: Section | Division | Initiative | Progress Update
+No merged cells. One record per row.
 
 Requirements (install once):
     pip install python-docx openpyxl
@@ -16,14 +15,16 @@ Usage:
 """
 
 import sys
-from itertools import groupby
 from docx import Document
 from docx.oxml.ns import qn
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 SECTION_NAMES = {"progress", "plans", "problems"}
 
+
+# ── Parsing helpers ───────────────────────────────────────────────────────────
 
 def get_indent_level(para):
     pPr = para._p.find(qn("w:pPr"))
@@ -57,7 +58,6 @@ def extract_bold_and_rest(para):
 
 
 def is_division_header(para):
-    """Short, non-list paragraph that isn't a section name."""
     text = para.text.strip()
     if not text or len(text) > 120:
         return False
@@ -69,12 +69,6 @@ def is_division_header(para):
 
 
 def parse_cell_paragraphs(cell_paragraphs, section, results):
-    """
-    Parse paragraphs from a content cell.
-    First non-empty non-section paragraph is treated as the division header.
-    Subsequent list paragraphs are initiatives/updates.
-    Nested bullets become notes on the parent.
-    """
     current_division = "Unknown"
     last_top_level = None
     found_division = False
@@ -83,17 +77,14 @@ def parse_cell_paragraphs(cell_paragraphs, section, results):
         text = para.text.strip()
         if not text:
             continue
-
         if text.lower() in SECTION_NAMES:
             continue
 
-        # First real paragraph in cell = division header
         if not found_division and not is_list_paragraph(para):
             current_division = text
             found_division = True
             continue
 
-        # Some docs put division header as a non-list paragraph mid-cell
         if is_division_header(para) and not is_list_paragraph(para):
             current_division = text
             last_top_level = None
@@ -118,7 +109,6 @@ def parse_cell_paragraphs(cell_paragraphs, section, results):
                     note = (bold + (": " + rest if rest else "")) if bold else text
                     last_top_level["notes"].append(note)
         else:
-            # Non-list paragraph after division header = treat as plain text entry
             if found_division:
                 bold, rest = extract_bold_and_rest(para)
                 entry = {
@@ -140,58 +130,41 @@ def parse_document(path):
     for table in doc.tables:
         for row in table.rows:
             cells = row.cells
-
-            # Check if any cell in this row is a section label
             for cell in cells:
-                cell_text = cell.text.strip()
-                if cell_text.lower() in SECTION_NAMES:
-                    current_section = cell_text.capitalize()
+                if cell.text.strip().lower() in SECTION_NAMES:
+                    current_section = cell.text.strip().capitalize()
                     break
-
-            # Parse content cells (skip cells that are just section labels)
             for cell in cells:
                 cell_text = cell.text.strip()
-                if cell_text.lower() in SECTION_NAMES:
-                    continue
-                if not cell_text:
+                if cell_text.lower() in SECTION_NAMES or not cell_text:
                     continue
                 parse_cell_paragraphs(cell.paragraphs, current_section, raw_results)
 
-    # Flatten notes
     result = []
     for e in raw_results:
         update = e["update"]
         if e["notes"]:
             notes_str = " | ".join(e["notes"])
-            update = (update + "\n[Notes: " + notes_str + "]") if update else "[Notes: " + notes_str + "]"
+            update = (update + " [Notes: " + notes_str + "]") if update else "[Notes: " + notes_str + "]"
         result.append({
-            "section": e["section"],
-            "division": e["division"],
+            "section":    e["section"],
+            "division":   e["division"],
             "initiative": e["initiative"],
-            "update": update,
+            "update":     update,
         })
     return result
 
 
 # ── Excel output ──────────────────────────────────────────────────────────────
 
-def thin_border():
-    s = Side(style="thin", color="CCCCCC")
+def header_border():
+    s = Side(style="medium", color="1F4E79")
     return Border(left=s, right=s, top=s, bottom=s)
 
 
-def apply_header_style(cell, bg_hex):
-    cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-    cell.fill = PatternFill("solid", start_color=bg_hex)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border = thin_border()
-
-
-def apply_section_style(cell, bg_hex):
-    cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    cell.fill = PatternFill("solid", start_color=bg_hex)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border = thin_border()
+def cell_border():
+    s = Side(style="thin", color="BFBFBF")
+    return Border(left=s, right=s, top=s, bottom=s)
 
 
 def write_excel(data, out_path):
@@ -199,92 +172,76 @@ def write_excel(data, out_path):
     ws = wb.active
     ws.title = "Tracker"
 
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = ["Section", "Division", "Initiative", "Progress Update"]
+    header_fill = PatternFill("solid", start_color="1F4E79")
+
+    for col, h in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        c.fill = header_fill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = header_border()
+    ws.row_dimensions[1].height = 24
+
+    # ── Section color map (text only — no background fill on data rows) ───────
     section_colors = {
         "Progress": "1F4E79",
         "Plans":    "375623",
         "Problems": "833C00",
     }
-    even_fill = PatternFill("solid", start_color="EBF3FB")
+
+    # Alternating row fills (subtle, won't interfere with PBI)
+    even_fill = PatternFill("solid", start_color="EEF3F9")
     odd_fill  = PatternFill("solid", start_color="FFFFFF")
 
-    for col, (h, c) in enumerate(
-        zip(["Section", "Division", "Initiative", "Progress Update"],
-            ["1F4E79", "1F4E79", "2E75B6", "2E75B6"]), start=1
-    ):
-        apply_header_style(ws.cell(row=1, column=col, value=h), c)
-    ws.row_dimensions[1].height = 28
-
+    # ── Data rows — one record per row, every cell populated ─────────────────
     section_order = ["Progress", "Plans", "Problems"]
     data_sorted = sorted(
         data,
         key=lambda x: section_order.index(x["section"]) if x["section"] in section_order else 99
     )
 
-    current_row = 2
-    for section_name, sec_group in groupby(data_sorted, key=lambda x: x["section"]):
-        entries = list(sec_group)
-        sec_color = section_colors.get(section_name, "404040")
-        section_start = current_row
-        div_idx = 0
+    for row_idx, entry in enumerate(data_sorted, start=2):
+        fill = even_fill if row_idx % 2 == 0 else odd_fill
+        sec_color = section_colors.get(entry["section"], "404040")
 
-        for division_name, div_group in groupby(entries, key=lambda x: x["division"]):
-            div_entries = list(div_group)
-            div_start = current_row
+        values = [entry["section"], entry["division"], entry["initiative"], entry["update"]]
+        for col, val in enumerate(values, start=1):
+            c = ws.cell(row=row_idx, column=col, value=val)
+            c.fill = fill
+            c.border = cell_border()
+            c.alignment = Alignment(vertical="top", wrap_text=True)
 
-            for entry in div_entries:
-                fill = even_fill if div_idx % 2 == 0 else odd_fill
+            if col == 1:
+                # Section cell: colored bold text
+                c.font = Font(name="Arial", bold=True, size=10, color=sec_color)
+                c.alignment = Alignment(horizontal="center", vertical="top")
+            elif col == 2:
+                # Division: bold
+                c.font = Font(name="Arial", bold=True, size=10)
+            elif col == 3:
+                # Initiative: bold
+                c.font = Font(name="Arial", bold=True, size=10)
+            else:
+                # Progress Update: normal
+                c.font = Font(name="Arial", size=10)
 
-                ws.cell(row=current_row, column=1, value=section_name)
-                apply_section_style(ws.cell(row=current_row, column=1), sec_color)
+        ws.row_dimensions[row_idx].height = 40
 
-                dc = ws.cell(row=current_row, column=2, value=division_name)
-                dc.font = Font(name="Arial", bold=True, size=10)
-                dc.fill = PatternFill("solid", start_color="D9E1F2")
-                dc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                dc.border = thin_border()
+    # ── Column widths ─────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 14   # Section
+    ws.column_dimensions["B"].width = 26   # Division
+    ws.column_dimensions["C"].width = 32   # Initiative
+    ws.column_dimensions["D"].width = 70   # Progress Update
 
-                ic = ws.cell(row=current_row, column=3, value=entry["initiative"])
-                ic.font = Font(name="Arial", bold=True, size=10)
-                ic.fill = fill
-                ic.alignment = Alignment(vertical="top", wrap_text=True)
-                ic.border = thin_border()
-
-                uc = ws.cell(row=current_row, column=4, value=entry["update"])
-                uc.font = Font(name="Arial", size=10)
-                uc.fill = fill
-                uc.alignment = Alignment(vertical="top", wrap_text=True)
-                uc.border = thin_border()
-
-                ws.row_dimensions[current_row].height = 50
-                current_row += 1
-
-            # Merge division cells
-            if current_row - 1 >= div_start:
-                ws.merge_cells(start_row=div_start, start_column=2,
-                               end_row=current_row - 1, end_column=2)
-                dc = ws.cell(row=div_start, column=2)
-                dc.font = Font(name="Arial", bold=True, size=10)
-                dc.fill = PatternFill("solid", start_color="D9E1F2")
-                dc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                dc.border = thin_border()
-
-            div_idx += 1
-
-        # Merge section cells
-        if current_row - 1 >= section_start:
-            ws.merge_cells(start_row=section_start, start_column=1,
-                           end_row=current_row - 1, end_column=1)
-            apply_section_style(ws.cell(row=section_start, column=1), sec_color)
-
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 32
-    ws.column_dimensions["D"].width = 65
+    # ── Freeze header + auto-filter ───────────────────────────────────────────
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:D1"
+    last_col = get_column_letter(len(headers))
+    ws.auto_filter.ref = f"A1:{last_col}1"
 
     wb.save(out_path)
-    print(f"✓ Saved: {out_path}")
+    print(f"✓ Saved: {out_path}  ({len(data_sorted)} rows)")
 
 
 def main():
