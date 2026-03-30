@@ -1,11 +1,12 @@
 """
 docx_to_excel.py
 
-Parses a Word document (table-based structure) into a flat Excel table
-suitable for Power BI and Power Automate.
+Parses a Word document (table-based structure) and APPENDS new records
+to an existing Excel master table. Duplicate rows (same Section, Division,
+Initiative, and Progress Update) are skipped. Each new row is stamped
+with today's date.
 
-Every row contains: Section | Division | Initiative | Progress Update
-No merged cells. One record per row.
+Columns: Date | Section | Division | Initiative | Progress Update
 
 Requirements (install once):
     pip install python-docx openpyxl
@@ -15,13 +16,16 @@ Usage:
 """
 
 import sys
+import os
+from datetime import date
 from docx import Document
 from docx.oxml.ns import qn
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 SECTION_NAMES = {"progress", "plans", "problems"}
+HEADERS = ["Date", "Section", "Division", "Initiative", "Progress Update"]
 
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
@@ -96,11 +100,11 @@ def parse_cell_paragraphs(cell_paragraphs, section, results):
 
             if indent == 0:
                 entry = {
-                    "section": section,
-                    "division": current_division,
+                    "section":    section,
+                    "division":   current_division,
                     "initiative": bold if bold else text,
-                    "update": rest if bold else "",
-                    "notes": [],
+                    "update":     rest if bold else "",
+                    "notes":      [],
                 }
                 results.append(entry)
                 last_top_level = entry
@@ -112,11 +116,11 @@ def parse_cell_paragraphs(cell_paragraphs, section, results):
             if found_division:
                 bold, rest = extract_bold_and_rest(para)
                 entry = {
-                    "section": section,
-                    "division": current_division,
+                    "section":    section,
+                    "division":   current_division,
                     "initiative": bold if bold else text,
-                    "update": rest if bold else "",
-                    "notes": [],
+                    "update":     rest if bold else "",
+                    "notes":      [],
                 }
                 results.append(entry)
                 last_top_level = entry
@@ -155,7 +159,7 @@ def parse_document(path):
     return result
 
 
-# ── Excel output ──────────────────────────────────────────────────────────────
+# ── Excel helpers ─────────────────────────────────────────────────────────────
 
 def header_border():
     s = Side(style="medium", color="1F4E79")
@@ -167,100 +171,144 @@ def cell_border():
     return Border(left=s, right=s, top=s, bottom=s)
 
 
-def write_excel(data, out_path):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Tracker"
-
-    # ── Header row ────────────────────────────────────────────────────────────
-    headers = ["Section", "Division", "Initiative", "Progress Update"]
+def style_header_row(ws):
     header_fill = PatternFill("solid", start_color="1F4E79")
-
-    for col, h in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=col, value=h)
+    for col in range(1, len(HEADERS) + 1):
+        c = ws.cell(row=1, column=col)
         c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
         c.fill = header_fill
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = header_border()
     ws.row_dimensions[1].height = 24
 
-    # ── Section color map (text only — no background fill on data rows) ───────
+
+def style_data_row(ws, row_idx, section):
     section_colors = {
         "Progress": "1F4E79",
         "Plans":    "375623",
         "Problems": "833C00",
     }
-
-    # Alternating row fills (subtle, won't interfere with PBI)
     even_fill = PatternFill("solid", start_color="EEF3F9")
     odd_fill  = PatternFill("solid", start_color="FFFFFF")
+    fill = even_fill if row_idx % 2 == 0 else odd_fill
+    sec_color = section_colors.get(section, "404040")
 
-    # ── Data rows — one record per row, every cell populated ─────────────────
-    section_order = ["Progress", "Plans", "Problems"]
-    data_sorted = sorted(
-        data,
-        key=lambda x: section_order.index(x["section"]) if x["section"] in section_order else 99
-    )
+    for col in range(1, len(HEADERS) + 1):
+        c = ws.cell(row=row_idx, column=col)
+        c.fill = fill
+        c.border = cell_border()
+        c.alignment = Alignment(vertical="top", wrap_text=True)
 
-    for row_idx, entry in enumerate(data_sorted, start=2):
-        fill = even_fill if row_idx % 2 == 0 else odd_fill
-        sec_color = section_colors.get(entry["section"], "404040")
+        if col == 1:  # Date
+            c.font = Font(name="Arial", size=10)
+            c.alignment = Alignment(horizontal="center", vertical="top")
+            c.number_format = "MM/DD/YYYY"
+        elif col == 2:  # Section
+            c.font = Font(name="Arial", bold=True, size=10, color=sec_color)
+            c.alignment = Alignment(horizontal="center", vertical="top")
+        elif col in (3, 4):  # Division, Initiative
+            c.font = Font(name="Arial", bold=True, size=10)
+        else:  # Progress Update
+            c.font = Font(name="Arial", size=10)
 
-        values = [entry["section"], entry["division"], entry["initiative"], entry["update"]]
-        for col, val in enumerate(values, start=1):
-            c = ws.cell(row=row_idx, column=col, value=val)
-            c.fill = fill
-            c.border = cell_border()
-            c.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.row_dimensions[row_idx].height = 40
 
-            if col == 1:
-                # Section cell: colored bold text
-                c.font = Font(name="Arial", bold=True, size=10, color=sec_color)
-                c.alignment = Alignment(horizontal="center", vertical="top")
-            elif col == 2:
-                # Division: bold
-                c.font = Font(name="Arial", bold=True, size=10)
-            elif col == 3:
-                # Initiative: bold
-                c.font = Font(name="Arial", bold=True, size=10)
-            else:
-                # Progress Update: normal
-                c.font = Font(name="Arial", size=10)
 
-        ws.row_dimensions[row_idx].height = 40
+def set_column_widths(ws):
+    widths = {"A": 14, "B": 14, "C": 26, "D": 32, "E": 70}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
 
-    # ── Column widths ─────────────────────────────────────────────────────────
-    ws.column_dimensions["A"].width = 14   # Section
-    ws.column_dimensions["B"].width = 26   # Division
-    ws.column_dimensions["C"].width = 32   # Initiative
-    ws.column_dimensions["D"].width = 70   # Progress Update
 
-    # ── Freeze header + auto-filter ───────────────────────────────────────────
-    ws.freeze_panes = "A2"
-    last_col = get_column_letter(len(headers))
-    ws.auto_filter.ref = f"A1:{last_col}1"
+def load_existing_records(ws):
+    """
+    Returns a set of tuples (section, division, initiative, update)
+    from all existing data rows, used for dedup checking.
+    Date is intentionally excluded so re-runs on same content are caught
+    regardless of when they were first added.
+    """
+    existing = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if any(row):
+            # row = (date, section, division, initiative, update)
+            key = (
+                str(row[1] or "").strip(),
+                str(row[2] or "").strip(),
+                str(row[3] or "").strip(),
+                str(row[4] or "").strip(),
+            )
+            existing.add(key)
+    return existing
 
-    wb.save(out_path)
-    print(f"✓ Saved: {out_path}  ({len(data_sorted)} rows)")
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 3:
         print("Usage: python docx_to_excel.py input.docx output.xlsx")
         sys.exit(1)
 
-    data = parse_document(sys.argv[1])
+    in_path  = sys.argv[1]
+    out_path = sys.argv[2]
+    today    = date.today()
+
+    # Parse the Word doc
+    print(f"Reading: {in_path}")
+    data = parse_document(in_path)
     if not data:
-        print("No entries found. Run diagnose.py and share the output.")
+        print("No entries found. Run diagnose.py to inspect document structure.")
         sys.exit(1)
 
-    counts = {}
-    for e in data:
-        counts[e["section"]] = counts.get(e["section"], 0) + 1
-    for sec, n in counts.items():
-        print(f"  • {sec}: {n} entries")
+    section_order = ["Progress", "Plans", "Problems"]
+    data_sorted = sorted(
+        data,
+        key=lambda x: section_order.index(x["section"]) if x["section"] in section_order else 99
+    )
 
-    write_excel(data, sys.argv[2])
+    # Load or create the workbook
+    if os.path.exists(out_path):
+        print(f"Appending to existing file: {out_path}")
+        wb = load_workbook(out_path)
+        ws = wb.active
+        existing_records = load_existing_records(ws)
+    else:
+        print(f"Creating new file: {out_path}")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Tracker"
+        for col, h in enumerate(HEADERS, start=1):
+            ws.cell(row=1, column=col, value=h)
+        style_header_row(ws)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"
+        set_column_widths(ws)
+        existing_records = set()
+
+    # Append new rows
+    added = 0
+    skipped = 0
+    next_row = ws.max_row + 1
+
+    for entry in data_sorted:
+        key = (entry["section"], entry["division"], entry["initiative"], entry["update"])
+        if key in existing_records:
+            skipped += 1
+            continue
+
+        ws.cell(row=next_row, column=1, value=today)
+        ws.cell(row=next_row, column=2, value=entry["section"])
+        ws.cell(row=next_row, column=3, value=entry["division"])
+        ws.cell(row=next_row, column=4, value=entry["initiative"])
+        ws.cell(row=next_row, column=5, value=entry["update"])
+
+        style_data_row(ws, next_row, entry["section"])
+        existing_records.add(key)
+        next_row += 1
+        added += 1
+
+    wb.save(out_path)
+    print(f"✓ Done — {added} rows added, {skipped} duplicates skipped.")
+    print(f"✓ Saved: {out_path}")
 
 
 if __name__ == "__main__":
